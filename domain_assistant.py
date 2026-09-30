@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import OpenAI, OpenAIError, RateLimitError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -254,13 +254,27 @@ class OpenAIGenerator:
         self.max_output_tokens = max_output_tokens
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
+        # Lab change: the Gemini OpenAI-compatible endpoint (OPENAI_BASE_URL in
+        # .env) does not serve the Responses API, so the same single-turn prompt
+        # is sent through Chat Completions. Prompt, temperature and output cap
+        # are unchanged. Gemini's hidden thinking tokens count against the cap
+        # and truncated answers at the default effort, so reasoning is set low.
+        # The free tier allows ~5 requests/minute, so wait and retry on 429.
+        for attempt in range(6):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                    reasoning_effort="low",
+                )
+                break
+            except RateLimitError as exc:
+                if attempt == 5 or "PerDay" in str(exc):  # daily quota: retry is useless
+                    raise
+                time.sleep(30)
+        answer = (response.choices[0].message.content or "").strip()
         if not answer:
             raise RuntimeError("OpenAI returned an empty answer")
         return answer
